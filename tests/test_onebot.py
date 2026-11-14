@@ -58,10 +58,11 @@ def test_reply_segment_refused() -> None:
     assert result["retcode"] == 1404 and "回复" in result["wording"]
 
 
-def test_unknown_action_lists_supported() -> None:
+def test_unknown_action_wording_matches_upstream() -> None:
+    """不在 213 个动作面里的名字，wording 与 SnowLuma 一致。"""
     result = make().call("no_such_action", {})
     assert result["retcode"] == 1404
-    assert "不认识的动作" in result["wording"]
+    assert result["wording"] == "unknown action"
 
 
 def test_known_unsupported_action_has_reason() -> None:

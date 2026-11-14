@@ -95,17 +95,22 @@ class _WsSink:
 
 
 # ---------------------------------------------------------------- HTTP 动作
-def _extract_action(handler: BaseHTTPRequestHandler, body: bytes) -> tuple[str, dict[str, Any], str]:
-    """兼容三种常见写法：JSON body / 表单 / GET 查询串。"""
+def _extract_action(handler: BaseHTTPRequestHandler, body: bytes) -> tuple[str, dict[str, Any], Any]:
+    """兼容三种常见写法：JSON body / 表单 / GET 查询串。
+
+    第三个返回值是 `echo`：请求没带就返回 None，调用方此时**不要**往响应里塞 echo
+    （SnowLuma 只在请求带 echo 时才回）。
+    """
     query = parse_qs(urlparse(handler.path).query)
-    echo = str((query.get("echo") or [""])[0])
+    echo: Any = (query.get("echo") or [None])[0]
     if body:
         try:
             data = json.loads(body.decode("utf-8"))
         except ValueError:
             data = None
         if isinstance(data, dict):
-            echo = str(data.get("echo") or echo)
+            if "echo" in data:
+                echo = data["echo"]
             action = str(data.get("action") or "")
             params = data.get("params")
             if params is None:
@@ -196,10 +201,11 @@ def make_http_handler(dispatcher: ob.Dispatcher, hub: EventHub, cfg: HttpServer,
             action, params, echo = _extract_action(self, b"")
             if not action:
                 self._json(HTTPStatus.OK, {"status": "ok", "retcode": 0,
-                                           "data": {"app": "SnowLink"}, "wording": ""})
+                                           "data": {"app": "SnowLink"}})
                 return
             result = dispatcher.call(action, params)
-            result["echo"] = echo
+            if echo is not None:
+                result["echo"] = echo
             self._json(HTTPStatus.OK, result)
 
         def do_POST(self) -> None:  # noqa: N802
@@ -213,7 +219,8 @@ def make_http_handler(dispatcher: ob.Dispatcher, hub: EventHub, cfg: HttpServer,
                                                     "data": None, "wording": "缺少 action"})
                 return
             result = dispatcher.call(action, params)
-            result["echo"] = echo
+            if echo is not None:
+                result["echo"] = echo
             self._json(HTTPStatus.OK, result)
 
         # ------------------------------------------------------------ WS 升级
@@ -422,7 +429,8 @@ class Gateway:
     """按配置把所有入口拉起来，并把后端事件转成 OneBot 事件广播出去。"""
 
     def __init__(self, cfg: OneBotConfig, backend_cfg: BackendConfig, *,
-                 uin: str = "", log: Callable[[str], None] | None = None) -> None:
+                 uin: str = "", log: Callable[[str], None] | None = None,
+                 app_name: str = "SnowLink") -> None:
         self.cfg = cfg
         self.backend_cfg = backend_cfg
         self.uin = uin or backend_cfg.uin
@@ -439,7 +447,8 @@ class Gateway:
             fmt = cfg.wsServers[0].messageFormat
         elif cfg.httpServers:
             fmt = cfg.httpServers[0].messageFormat
-        self.dispatcher = ob.Dispatcher(self.backend, self_id=self.uin, message_format=fmt)
+        self.dispatcher = ob.Dispatcher(self.backend, self_id=self.uin, message_format=fmt,
+                                        app_name=app_name)
         self._threads: list[threading.Thread] = []
         self._http_servers: list[ThreadingHTTPServer] = []
         self._started_at = 0.0

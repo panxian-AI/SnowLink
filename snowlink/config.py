@@ -241,6 +241,9 @@ class RuntimeConfig:
     logMaxTotalMb: int = 1024  # noqa: N815
     logRetainDays: int = 7  # noqa: N815
     logPerUin: bool = False  # noqa: N815
+    #: get_version_info 里上报的实现名。默认如实报 SnowLink；
+    #: 需要严格顶替 SnowLuma（有些框架按 app_name 分支）时改成 "SnowLuma"
+    appName: str = "SnowLink"  # noqa: N815
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RuntimeConfig":
@@ -252,6 +255,7 @@ class RuntimeConfig:
             logMaxTotalMb=int(data.get("logMaxTotalMb") or 1024),
             logRetainDays=int(data.get("logRetainDays") or 7),
             logPerUin=bool(data.get("logPerUin", False)),
+            appName=str(data.get("appName") or "SnowLink"),
         )
 
     def as_dict(self) -> dict[str, Any]:

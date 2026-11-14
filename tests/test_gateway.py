@@ -239,3 +239,12 @@ def test_http_report_posts_events() -> None:
     finally:
         gw.stop()
         capture.close()
+
+
+def test_echo_only_when_requested(gateway) -> None:
+    """请求没带 echo，响应里就不该有 echo 键（与 SnowLuma 一致）。"""
+    port = http_port(gateway)
+    _status, data = call_http(port, {"action": "get_login_info"})
+    assert "echo" not in data
+    _status, data = call_http(port, {"action": "get_login_info", "echo": "abc"})
+    assert data["echo"] == "abc"

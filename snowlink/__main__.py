@@ -72,7 +72,7 @@ def _run(args: argparse.Namespace) -> int:
         for item in cfg.httpServers + cfg.wsServers:
             item.messageFormat = args.message_format
 
-    gateway = Gateway(cfg, backend_cfg, uin=uin, log=print)
+    gateway = Gateway(cfg, backend_cfg, uin=uin, log=print, app_name=runtime.appName)
     try:
         gateway.start()
     except OSError as exc:

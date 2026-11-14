@@ -16,15 +16,18 @@ from collections import OrderedDict
 from typing import Any
 
 from . import __version__
+from . import contract as C
 from . import segments as seg_mod
 from .backend import BackendError
 
-RET_OK = 0
-RET_BAD_PARAM = 1400
-RET_UNSUPPORTED = 1404
-RET_BACKEND = 1500
+#: retcode 取值与 SnowLuma 的枚举一一对应（0 / 100 / 1200 / 1400 / 1404）
+RET_OK = C.RET_OK
+RET_ACTION_FAILED = C.RET_ACTION_FAILED
+RET_INTERNAL = C.RET_INTERNAL
+RET_BAD_PARAM = C.RET_BAD_REQUEST
+RET_UNSUPPORTED = C.RET_UNKNOWN_ACTION
 
-#: 明确不支持的动作用一句话解释（retcode 1404）
+#: 个别动作的原因比「能力族」那句更具体，这里覆盖
 UNSUPPORTED: dict[str, str] = {
     "delete_msg": "ArkLink 的通道还不能撤回消息（能力矩阵里 recall 为 false）",
     "get_group_member_info": "花名册接口还没接真实 QQ，暂时拿不到群成员资料",
@@ -70,10 +73,13 @@ def _now() -> int:
 class Dispatcher:
     """动作路由。同一个实例给所有入口（HTTP / WS / 反向 WS）共用。"""
 
-    def __init__(self, backend: Any, *, self_id: str = "", message_format: str = "array") -> None:
+    def __init__(self, backend: Any, *, self_id: str = "", message_format: str = "array",
+                 app_name: str = "SnowLink") -> None:
         self.backend = backend
         self._self_id = self_id
         self.message_format = message_format or "array"
+        self.app_name = app_name or "SnowLink"
+        self._started = time.time()
         self._self_cache: dict[str, Any] = {}
         self._cache: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._lock = threading.Lock()
@@ -111,27 +117,24 @@ class Dispatcher:
         try:
             handler = self._handlers().get(action)
             if handler is None:
-                if action in UNSUPPORTED:
-                    self.stats["unsupported"] += 1
-                    return self._fail(RET_UNSUPPORTED, UNSUPPORTED[action])
                 self.stats["unsupported"] += 1
-                sample = "、".join(sorted(self._handlers())[:6])
-                return self._fail(
-                    RET_UNSUPPORTED,
-                    f"不认识的动作 {action}。当前支持：{sample} 等；"
-                    "不支持的动作会明确返回 1404，不会假装成功",
-                )
+                why = UNSUPPORTED.get(action) or C.reason_of(action)
+                if why:
+                    # 动作存在、本实现做不到：给出具体原因，比「unknown action」有用
+                    return self._fail(RET_UNSUPPORTED, f"{action}：{why}")
+                # 完全不在 OneBot 动作面里，wording 与 SnowLuma 一致
+                return self._fail(RET_UNSUPPORTED, "unknown action")
             data = handler(params)
             if isinstance(data, dict) and data.get("__fail__"):
                 self.stats["failed"] += 1
                 return self._fail(int(data.get("code") or RET_BAD_PARAM), str(data.get("msg") or ""))
-            return {"status": "ok", "retcode": RET_OK, "data": data, "wording": ""}
+            return {"status": "ok", "retcode": RET_OK, "data": data}
         except ValueError as exc:
             self.stats["failed"] += 1
             return self._fail(RET_BAD_PARAM, str(exc))
         except BackendError as exc:
             self.stats["failed"] += 1
-            return self._fail(exc.code or RET_BACKEND, exc.msg)
+            return self._fail(exc.code or RET_INTERNAL, exc.msg)
 
     def _fail(self, retcode: int, wording: str) -> dict[str, Any]:
         return {"status": "failed", "retcode": retcode, "data": None, "wording": wording}
@@ -170,7 +173,7 @@ class Dispatcher:
             raise ValueError("缺少 user_id / group_id")
         result = self.backend.send(target, segments, group=group)
         if not result.ok:
-            return {"__fail__": True, "code": result.code or RET_BACKEND, "msg": result.msg}
+            return {"__fail__": True, "code": result.code or RET_INTERNAL, "msg": result.msg}
         with self._lock:
             self._sent += 1
             message_id = result.message_id or f"sl-{self._sent}"
@@ -197,27 +200,26 @@ class Dispatcher:
         return {"user_id": _as_int(self.self_id), "nickname": self.nickname()}
 
     def _get_status(self, params: dict[str, Any]) -> dict[str, Any]:
-        info: dict[str, Any] = {}
+        """返回字段与 SnowLuma 一致：online / good / time（实例运行秒数）。"""
         try:
             info = self.backend.status()
-        except BackendError as exc:
-            return {"online": False, "good": False, "reason": exc.msg}
+        except BackendError:
+            return {"online": False, "good": False, "time": int(time.time() - self._started)}
         return {
             "online": bool(info.get("online", True)),
             "good": bool(info.get("ok", True)),
-            "stat": {"packet_received": 0, "packet_sent": self._sent},
-            "backend": info,
+            "time": int(time.time() - self._started),
         }
 
     def _get_version_info(self, params: dict[str, Any]) -> dict[str, Any]:
         return {
-            "app_name": "SnowLink",
+            "app_name": self.app_name,
             "app_version": __version__,
             "protocol_version": "v11",
-            "backend": getattr(self.backend, "name", "unknown"),
         }
 
     def _get_friend_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """必填字段与 SnowLuma 一致：user_id / nickname / remark。"""
         out = []
         for item in self.backend.friends():
             uid = item.get("uin") or item.get("user_id") or item.get("uid") or ""
@@ -225,19 +227,26 @@ class Dispatcher:
                 "user_id": _as_int(uid),
                 "nickname": str(item.get("name") or item.get("nickname") or ""),
                 "remark": str(item.get("remark") or ""),
-                "snowlink_uid": str(uid),
             })
         return out
 
     def _get_group_list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """必填字段与 SnowLuma 一致：group_id / group_name / group_remark /
+        member_count / max_member_count / group_all_shut。"""
         out = []
         for item in self.backend.groups():
             gid = item.get("uin") or item.get("group_id") or item.get("uid") or ""
             out.append({
                 "group_id": _as_int(gid),
                 "group_name": str(item.get("name") or item.get("group_name") or ""),
+                "group_remark": str(item.get("remark") or ""),
                 "member_count": int(item.get("member_count") or 0),
-                "snowlink_uid": str(gid),
+                "max_member_count": int(item.get("max_member_count") or 0),
+                "group_all_shut": int(item.get("group_all_shut") or 0),
+                "group_create_time": int(item.get("group_create_time") or 0),
+                "group_level": int(item.get("group_level") or 0),
+                "group_memo": str(item.get("group_memo") or ""),
+                "group_description": str(item.get("group_description") or ""),
             })
         return out
 
@@ -251,15 +260,20 @@ class Dispatcher:
                     "group_name": str(item.get("name") or ""),
                     "member_count": int(item.get("member_count") or 0),
                 }
-        return {"__fail__": True, "code": RET_UNSUPPORTED, "msg": f"找不到群 {gid} 的资料"}
+        return {"__fail__": True, "code": RET_ACTION_FAILED, "msg": f"找不到群 {gid} 的资料"}
 
     def _get_msg(self, params: dict[str, Any]) -> dict[str, Any]:
+        """与 SnowLuma 一致：消息事件去掉 post_type / self_id，补 real_id。"""
         mid = str(params.get("message_id") or "")
         with self._lock:
             event = self._cache.get(mid)
         if event is None:
-            return {"__fail__": True, "code": RET_UNSUPPORTED, "msg": f"没有缓存消息 {mid}（只缓存本次运行收到的消息）"}
-        return event
+            return {"__fail__": True, "code": RET_ACTION_FAILED, "msg": "message not found"}
+        out = dict(event)
+        out.pop("post_type", None)
+        out.pop("self_id", None)
+        out["real_id"] = out.get("message_id") or _as_int(mid) or mid
+        return out
 
     def _can_send_image(self, params: dict[str, Any]) -> dict[str, Any]:
         return {"yes": False}
