@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+
+# 运行时产物（和 SnowLuma 一样：config/、data/、logs/ 都是本地状态）
+config/
+data/
+logs/

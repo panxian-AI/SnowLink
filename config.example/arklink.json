@@ -1,0 +1,7 @@
+{
+  "baseUrl": "http://127.0.0.1:6900",
+  "token": "CHANGE-ME-arklink",
+  "uin": "10000",
+  "timeout": 20,
+  "offline": false
+}

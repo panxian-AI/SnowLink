@@ -1,0 +1,9 @@
+{
+  "webuiPort": 5099,
+  "webuiHost": "127.0.0.1",
+  "hookAutoLoad": false,
+  "trustProxy": "",
+  "logMaxTotalMb": 1024,
+  "logRetainDays": 7,
+  "logPerUin": false
+}

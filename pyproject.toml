@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snowlink"
+version = "0.1.0"
+description = "SnowLuma 位置的顶替品：OneBot v11 协议端，底层走 ArkLink 的官方客户端通道（不注入、不改协议）"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "panxian-AI" }]
+keywords = ["onebot", "qq", "bot", "arklink", "snowluma"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.scripts]
+snowlink = "snowlink.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/panxian-AI/SnowLink"
+
+[tool.setuptools]
+packages = ["snowlink"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
