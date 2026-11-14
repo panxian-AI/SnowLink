@@ -16,6 +16,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -46,6 +47,41 @@ class BackendError(Exception):
         super().__init__(msg)
         self.msg = msg
         self.code = code
+
+
+def attachment_error(segments: list[dict[str, Any]]) -> tuple[int, str] | None:
+    """附件能不能发：必须是**本机真实存在**的文件。
+
+    剪贴板只能粘本机上已经有的文件，所以这里有三种必然发不出去的情况，
+    而且都必须在这里拦掉：
+
+    * 没给 `file` 字段 —— 不知道怎么取字节；
+    * 给的是 URL/base64 —— 得先下载，而下载策略（超时、大小、落盘位置）
+      不该悄悄塞进发送路径；
+    * 路径指向的文件不存在 —— 剪贴板照样「写入成功」，回车后只发出文字，
+      客户端也不报错，是最难查的一种静默失败。
+
+    两个后端共用这份判断，保证演练通过的东西在真机上也能通过。
+    """
+    for seg in segments:
+        kind = str(seg.get("type") or "")
+        if kind not in seg_mod.ATTACHMENT_KINDS:
+            continue
+        target = seg_mod.file_of(seg)
+        if not target:
+            return 1404, f"{kind} 段缺少 file 字段"
+        if seg_mod.is_remote(seg):
+            return 1404, (
+                f"{kind} 段给的是地址而不是本机文件，剪贴板粘不了远程资源；"
+                "先把文件下载到磁盘，再把路径放进 file 字段"
+            )
+        if not Path(target).expanduser().is_file():
+            return 1404, f"{kind} 段指向的本机文件不存在：{target}"
+    return None
+
+
+def has_attachment(segments: list[dict[str, Any]]) -> bool:
+    return any(str(seg.get("type") or "") in seg_mod.ATTACHMENT_KINDS for seg in segments)
 
 
 # ---------------------------------------------------------------- ArkLink
@@ -106,8 +142,7 @@ class ArkLinkBackend:
             conn.close()
 
     # ---------------------------------------------------------------- 能力
-    def health(self) -> dict[str, Any]:
-        return self.request("GET", "/api/v1/health", timeout=3)
+    def health(self) -> dict[str, Any]:        return self.request("GET", "/api/v1/health", timeout=3)
 
     def status(self) -> dict[str, Any]:
         return self.request("GET", "/api/v1/status")
@@ -146,16 +181,34 @@ class ArkLinkBackend:
         ]
         missing = list(dict.fromkeys(missing))
         if missing:
+            file_only = [k for k in missing if k in seg_mod.FILE_ONLY_KINDS]
+            if file_only and len(file_only) == len(missing):
+                names = "、".join(seg_mod.TYPE_NAMES.get(k, k) for k in file_only)
+                return SendResult(
+                    False,
+                    1404,
+                    f"{names}不能按原样发：剪贴板粘过去对方收到的是文件附件，不是原生"
+                    "语音条/视频消息。要发就用 file 段，而且必须先落到本机。",
+                )
             names = "、".join(seg_mod.TYPE_NAMES.get(k, k) for k in missing)
             return SendResult(
                 False,
                 1404,
-                f"当前通道只能发文本，这条消息里有：{names}。"
-                "（ArkLink 的能力矩阵里这些项是 false；补上通道后接口不用改）",
+                f"当前通道只能发文本、图片和文件，这条消息里有：{names}。"
+                "（其余段需要进程内直发通道；补上通道后接口不用改）",
             )
 
-        text = seg_mod.text_of(segments)
-        payload: dict[str, Any] = {"to": target, "text": text, "dry_run": bool(dry_run)}
+        problem = attachment_error(segments)
+        if problem is not None:
+            return SendResult(False, problem[0], problem[1])
+
+        payload: dict[str, Any] = {"to": target, "dry_run": bool(dry_run)}
+        if has_attachment(segments):
+            # 带附件时必须发段数组：`text` 字段只装得下文字，
+            # 而且底层会按行拆成多条，一条 OneBot 消息就变成了好几条。
+            payload["message"] = segments
+        else:
+            payload["text"] = seg_mod.text_of(segments)
         if group:
             payload["group_id"] = target
         data = self.request("POST", "/api/v1/send", payload)
@@ -265,7 +318,8 @@ class DemoBackend:
         return {"ok": True, "online": True, "offline": True, "engine": "demo"}
 
     def capabilities(self) -> dict[str, Any]:
-        return {"ok": True, "channel": "demo", "items": {"send.text": True, "image": False}}
+        return {"ok": True, "channel": "demo",
+                "items": {"send.text": True, "image": True, "file": True}}
 
     def self_info(self) -> dict[str, Any]:
         return {"ok": True, "uin": "10000", "nickname": "SnowLink Demo"}
@@ -286,7 +340,11 @@ class DemoBackend:
         missing = list(dict.fromkeys(missing))
         if missing:
             names = "、".join(seg_mod.TYPE_NAMES.get(k, k) for k in missing)
-            return SendResult(False, 1404, f"演示通道只能发文本，这条消息里有：{names}")
+            return SendResult(False, 1404, f"演示通道只能发文本、图片和文件，这条消息里有：{names}")
+        # 演练也要拦住「文件不存在」这类问题，否则演示通过、真机静默失败
+        problem = attachment_error(segments)
+        if problem is not None:
+            return SendResult(False, problem[0], problem[1])
         self._n += 1
         item = {
             "to": target,

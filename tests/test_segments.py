@@ -176,12 +176,15 @@ def test_element_to_segment_shapes() -> None:
 def test_unsupported_reports_types_in_order() -> None:
     elements = seg.parse_message([
         {"type": "text", "data": {"text": "看这个"}},
-        {"type": "image", "data": {"file": "a.png"}},
+        {"type": "face", "data": {"id": "1"}},
         {"type": "at", "data": {"qq": "10001"}},
-        {"type": "image", "data": {"file": "b.png"}},
+        {"type": "face", "data": {"id": "2"}},
     ])
-    assert seg.unsupported_elements(elements) == ["image", "at"]
+    assert seg.unsupported_elements(elements) == ["face", "at"]
     assert seg.unsupported_elements([{"type": "text", "text": "ok"}]) == []
+    # 图片和文件现在可发，不该出现在「不支持」里
+    assert seg.unsupported_elements([{"type": "image", "url": "a.png"},
+                                     {"type": "file", "url": "/tmp/a.pdf"}]) == []
 
 
 def test_text_of_elements() -> None:

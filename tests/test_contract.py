@@ -113,7 +113,11 @@ def test_app_name_override_for_strict_drop_in() -> None:
     assert data["app_name"] == "SnowLuma"
 
 
-@pytest.mark.parametrize("name", ["can_send_image", "can_send_record"])
-def test_capability_queries_say_no(name: str) -> None:
-    data = make().call(name, {})["data"]
-    assert data == {"yes": False}
+def test_can_send_image_follows_backend() -> None:
+    """图片现在能发了（剪贴板粘贴），探测就该如实说 yes。"""
+    assert make().call("can_send_image", {})["data"] == {"yes": True}
+
+
+def test_can_send_record_still_says_no() -> None:
+    """语音只能当文件发，不是原生语音条，所以仍然是否。"""
+    assert make().call("can_send_record", {})["data"] == {"yes": False}

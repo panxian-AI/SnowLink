@@ -54,15 +54,51 @@ def test_send_msg_requires_a_target() -> None:
     assert result["wording"] == "at least one of: group_id, user_id"
 
 
-def test_image_is_refused_with_reason() -> None:
+def test_image_segment_is_accepted(tmp_path) -> None:
+    """图片能发了：剪贴板粘贴本地文件，不再一律 1404。"""
+    real = tmp_path / "a.png"
+    real.write_bytes(b"\x89PNG")
     dispatcher = make()
     result = dispatcher.call("send_group_msg", {
         "group_id": 20001,
-        "message": [{"type": "image", "data": {"file": "a.png"}}],
+        "message": [{"type": "image", "data": {"file": str(real)}}],
+    })
+    assert result["retcode"] == 0
+    # 纯附件没有文字：不能把 [图片] 当正文发出去
+    assert dispatcher.backend.sent[0]["text"] == ""
+
+
+def test_remote_image_is_refused_with_reason() -> None:
+    dispatcher = make()
+    result = dispatcher.call("send_group_msg", {
+        "group_id": 20001,
+        "message": [{"type": "image", "data": {"file": "https://example.com/a.png"}}],
     })
     assert result["retcode"] == 1404
-    assert "图片" in result["wording"]
-    assert dispatcher.backend.sent == []  # 没有偷偷降级成 [图片]
+    assert "地址" in result["wording"]
+    assert dispatcher.backend.sent == []
+
+
+def test_missing_local_file_is_refused() -> None:
+    """路径不存在时剪贴板照样「成功」，所以必须在入口拦住。"""
+    dispatcher = make()
+    result = dispatcher.call("send_group_msg", {
+        "group_id": 20001,
+        "message": [{"type": "image", "data": {"file": "/no/such/file.png"}}],
+    })
+    assert result["retcode"] == 1404
+    assert "不存在" in result["wording"]
+
+
+def test_video_segment_tells_you_to_use_file(tmp_path) -> None:
+    real = tmp_path / "a.mp4"
+    real.write_bytes(b"\x00")
+    result = make().call("send_group_msg", {
+        "group_id": 20001,
+        "message": [{"type": "video", "data": {"file": str(real)}}],
+    })
+    assert result["retcode"] == 1404
+    assert "file 段" in result["wording"]
 
 
 def test_reply_segment_refused() -> None:
@@ -168,9 +204,11 @@ def test_group_info_falls_back_to_empty_shape() -> None:
     assert data["group_id"] == 999 and data["group_name"] == ""
 
 
-def test_can_send_image_is_false() -> None:
+def test_can_send_queries_are_honest() -> None:
     dispatcher = make()
-    assert dispatcher.call("can_send_image", {})["data"] == {"yes": False}
+    # 图片：剪贴板能粘，所以 yes
+    assert dispatcher.call("can_send_image", {})["data"] == {"yes": True}
+    # 语音：只能当文件发，不是语音条
     assert dispatcher.call("can_send_record", {})["data"] == {"yes": False}
 
 
@@ -275,3 +313,63 @@ def test_stats_counts() -> None:
     dispatcher.call("get_group_member_list", {"group_id": 20001})
     assert dispatcher.stats["actions"] == 2
     assert dispatcher.stats["unsupported"] == 1
+
+
+# ---------------------------------------------------------------- 附件通道
+def test_text_and_image_keeps_text_clean(tmp_path) -> None:
+    """图文混发：文字就是文字，不能把 [图片] 拼进去。"""
+    real = tmp_path / "a.png"
+    real.write_bytes(b"\x89PNG")
+    dispatcher = make()
+    result = dispatcher.call("send_private_msg", {
+        "user_id": 10001,
+        "message": [
+            {"type": "text", "data": {"text": "看图"}},
+            {"type": "image", "data": {"file": str(real)}},
+        ],
+    })
+    assert result["retcode"] == 0
+    assert dispatcher.backend.sent[0]["text"] == "看图"
+
+
+def test_file_segment_is_accepted(tmp_path) -> None:
+    real = tmp_path / "报告.pdf"
+    real.write_bytes(b"%PDF-1.4")
+    result = make().call("send_group_msg", {
+        "group_id": 20001,
+        "message": [{"type": "file", "data": {"file": str(real)}}],
+    })
+    assert result["retcode"] == 0
+
+
+def test_backend_sends_segment_array_for_attachments(tmp_path, monkeypatch) -> None:
+    """带附件必须发段数组：`text` 只装得下文字，还会被按行拆成多条。"""
+    from snowlink.backend import ArkLinkBackend
+
+    real = tmp_path / "a.png"
+    real.write_bytes(b"\x89PNG")
+    backend = ArkLinkBackend("http://127.0.0.1:1")
+    seen: dict = {}
+
+    def fake_request(method, path, payload=None, **kwargs):
+        seen["payload"] = payload
+        return {"ok": True, "items": [{}]}
+
+    monkeypatch.setattr(backend, "request", fake_request)
+    result = backend.send("10001", [
+        {"type": "text", "data": {"text": "看图"}},
+        {"type": "image", "data": {"file": str(real)}},
+    ])
+    assert result.ok
+    assert "message" in seen["payload"] and "text" not in seen["payload"]
+
+
+def test_backend_sends_plain_text_for_text_only(monkeypatch) -> None:
+    from snowlink.backend import ArkLinkBackend
+
+    backend = ArkLinkBackend("http://127.0.0.1:1")
+    seen: dict = {}
+    monkeypatch.setattr(backend, "request",
+                        lambda m, p, payload=None, **k: seen.update(payload=payload) or {"ok": True, "items": [{}]})
+    assert backend.send("10001", [{"type": "text", "data": {"text": "hi"}}]).ok
+    assert seen["payload"]["text"] == "hi" and "message" not in seen["payload"]

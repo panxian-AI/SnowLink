@@ -49,10 +49,50 @@ TYPE_NAMES = {
     "inline_keyboard": "按钮面板",
 }
 
-#: 当前通道（ArkLink UI 通道）真能发出去的段类型
-SENDABLE = {"text"}
+#: 真能发出去的段类型。ArkLink 的 UI 通道把本地文件放进剪贴板再粘贴，
+#: 所以图片和文件都能发——但只能发**本机已有**的文件，URL 得先落盘。
+SENDABLE = {"text", "image", "file"}
+
+#: 需要伴随真实文件的段（含只允许「当文件发」的那两类）
+ATTACHMENT_KINDS = {"image", "file", "video", "record"}
+
+#: 只能以「文件」形式到达的段：剪贴板粘一个 mp4 过去，对方收到的是附件，
+#: 不是可播放的视频消息，更不是语音条。所以单独列出来，好给准确的原因。
+FILE_ONLY_KINDS = {"video", "record"}
+
+_REMOTE_PREFIXES = ("http://", "https://", "base64://", "data:", "file://")
 
 _CQ_RE = re.compile(r"\[CQ:([A-Za-z][A-Za-z0-9_]*)(?:,([^\]]*))?\]")
+
+
+def file_of(segment: dict[str, Any]) -> str:
+    """从一个附件段里取文件位置：`file` → `path` → `url`。
+
+    OneBot 实现们对同一个字段各有各的写法，段里通常只出现其中一个，
+    所以按优先级挨个看，别只认 `file`。
+    """
+    data = segment.get("data")
+    if not isinstance(data, dict):
+        return ""
+    for key in ("file", "path", "url"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def is_remote(segment: dict[str, Any]) -> bool:
+    """这个附件段给的是不是「地址」而不是本机路径。
+
+    注意空值不算 remote（那是「缺 file 字段」，文案要分开说）。
+    """
+    target = file_of(segment).lower()
+    return bool(target) and target.startswith(_REMOTE_PREFIXES)
+
+
+def has_attachment(elements: Iterable[dict[str, Any]]) -> bool:
+    """这批元素里有没有附件（图片/文件/视频/语音）。"""
+    return any(str(elem.get("type") or "") in ATTACHMENT_KINDS for elem in elements)
 
 
 # ---------------------------------------------------------------- CQ 编解码
@@ -627,7 +667,9 @@ def element_to_segment(elem: dict[str, Any]) -> dict[str, Any]:
             "type": "image",
             "data": {
                 "url": elem.get("url") or "",
-                "file": elem.get("fileId") or "",
+                # OneBot 里 `file` 才是主字段：没有 fileId 时把来源放进去，
+                # 免得下游只认 file 的实现拿到一个空串
+                "file": elem.get("fileId") or elem.get("url") or "",
                 "sub_type": elem.get("subType") or 0,
                 "summary": elem.get("summary") or "",
             },
@@ -642,7 +684,7 @@ def element_to_segment(elem: dict[str, Any]) -> dict[str, Any]:
         return {
             "type": "file",
             "data": {
-                "file": elem.get("fileName") or "",
+                "file": elem.get("fileName") or elem.get("fileId") or elem.get("url") or "",
                 "file_id": elem.get("fileId") or "",
                 "file_size": elem.get("fileSize") or 0,
                 "name": elem.get("fileName") or "",

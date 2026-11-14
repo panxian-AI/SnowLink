@@ -233,15 +233,24 @@ class Dispatcher:
         )
         missing = seg_mod.unsupported_elements(elements)
         if missing:
+            file_only = [k for k in missing if k in seg_mod.FILE_ONLY_KINDS]
+            if file_only and len(file_only) == len(missing):
+                names = "、".join(seg_mod.TYPE_NAMES.get(k, k) for k in file_only)
+                raise ActionError(
+                    f"{names}不能按原样发：剪贴板粘过去对方收到的是文件附件，"
+                    "不是原生语音条/视频消息。要发就用 file 段。",
+                    C.RET_UNKNOWN_ACTION,
+                )
             names = "、".join(seg_mod.TYPE_NAMES.get(k, k) for k in missing)
             raise ActionError(
-                f"当前通道只能发文本，这条消息里有：{names}。"
-                "（ArkLink 能力矩阵里这些项是 false，补上通道后接口不用改）",
+                f"当前通道只能发文本、图片和文件，这条消息里有：{names}。"
+                "（其余段需要进程内直发通道；补上通道后接口不用改）",
                 C.RET_UNKNOWN_ACTION,
             )
         if not target:
             raise BadRequest("user_id: is required" if not group else "group_id: is required")
-        if not seg_mod.text_of_elements(elements).strip():
+        # 纯附件消息没有文字，但完全合法：不能拿「有没有字」当「有没有内容」
+        if not seg_mod.text_of_elements(elements).strip() and not seg_mod.has_attachment(elements):
             raise BadRequest("message must contain at least one sendable segment")
 
         segments = seg_mod.to_segments(elements)
@@ -388,10 +397,28 @@ class Dispatcher:
         return None
 
     def can_send_image(self, _v: dict[str, Any]) -> dict[str, Any]:
-        return {"yes": False}
+        return {"yes": self._backend_can("image")}
 
     def can_send_record(self, _v: dict[str, Any]) -> dict[str, Any]:
+        # 语音只能作为文件发，不是原生语音条，所以对框架说「不能」
         return {"yes": False}
+
+    def _backend_can(self, key: str) -> bool:
+        """问底层到底行不行，而不是在这里写死。
+
+        `can_send_image` 常被框架当探测用：这里说谎会让人在真发的时候才失败。
+        """
+        try:
+            info = self.backend.capabilities()
+        except Exception:  # 后端不可达：此刻确实发不了
+            return False
+        items = info.get("items")
+        if isinstance(items, dict):
+            return bool(items.get(key))
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and item.get("key") == key:
+                return bool(item.get("ok"))
+        return False
 
     def get_capabilities(self, _v: dict[str, Any]) -> dict[str, Any]:
         info = self.backend.capabilities()
