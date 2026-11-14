@@ -1,15 +1,31 @@
-"""出口层：HTTP 服务端 / 正向 WS / 反向 WS / HTTP 上报 / WebUI。
+"""出口层：HTTP 服务端 / 正向 WS / 反向 WS / HTTP 上报。
 
-一个进程里同时把这些跑起来，配置与 SnowLuma 的 `networks` 一一对应：
+行为按 SnowLuma 的适配器逐条对齐（读的是它发行包里的 network 层）：
 
-    httpServers -> POST /（动作）      wsServers -> 框架连进来的 WS
-    wsClients   -> 我们连出去的 WS     httpClients -> 事件 POST 到指定地址
+HTTP
+  * 路径即动作：`/{base}/{action}`，`{base}` 之外一律 404 + retcode 1404；
+  * 鉴权只认 `Authorization: Bearer <token>` 与 `?access_token=`，失败 401 + 1401；
+  * GET 无动作 → `{status:"ok", retcode:0, data:{online:true}}`；
+  * GET 查询串每个值先按 JSON 解析（`?group_id=123` 得到数字），POST 支持
+    `application/x-www-form-urlencoded` 与 JSON，JSON 坏了回 `bad request: invalid json`；
+  * `echo` 只在请求带的时候回填；`Content-Length` 超 64MB 回 413 + 1413。
 
-所有入口共用同一个 `Dispatcher`，所以从哪个入口发消息，行为完全一致。
+WS
+  * 路径决定角色：`/api` → Api、`/event` → Event、其余 Universal；
+  * 连上就给 Event/Universal 推 `lifecycle(connect)`、`lifecycle(enable)`、`heartbeat`；
+  * 30 秒一次 ping，连续 3 个周期没有任何动静就掐掉半开连接；
+  * Event-only 连接发动作会被忽略（不回包，与它一致）；
+  * 关闭时给 Event/Universal 推 `lifecycle(disable)`。
+
+上报
+  * `User-Agent: OneBot`、`X-Self-ID`，有 token 时用 token 作密钥算 `X-Signature: sha1=...`；
+  * 响应是 JSON 时当作 quick operation 执行（reply / delete / ban）。
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import queue
 import socket
@@ -20,11 +36,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from . import events as ev
 from . import onebot as ob
 from . import segments as seg_mod
 from . import wsproto
-from .config import BackendConfig, HttpClient, HttpServer, OneBotConfig, WsClient, WsServer
-from .backend import ArkLinkBackend, DemoBackend
+from .backend import ArkLinkBackend, BackendError, DemoBackend
+from .config import (BackendConfig, HttpClient, HttpServer, OneBotConfig,
+                     WsClient, WsServer)
+
+MAX_BODY = 64 * 1024 * 1024
+HEARTBEAT_INTERVAL = 30.0
+HEARTBEAT_DEAD_AFTER = HEARTBEAT_INTERVAL * 3
 
 
 # ---------------------------------------------------------------- 事件中心
@@ -64,15 +86,26 @@ class EventHub:
             except Exception:  # 单个接收方坏了不影响别人
                 self.remove(sink)
 
+    def broadcast_frame(self, frame: str, roles: tuple[str, ...] = ("Event", "Universal")) -> None:
+        with self._lock:
+            sinks = list(self._sinks)
+        for sink in sinks:
+            if getattr(sink, "role", "") in roles:
+                try:
+                    sink.send_raw(frame)
+                except Exception:
+                    self.remove(sink)
 
+
+# ---------------------------------------------------------------- WS 出口
 class _WsSink:
-    """一条已连上的 WebSocket，用于推事件。"""
+    """一条已连上的 WebSocket，用于推事件 / 发响应。"""
 
     def __init__(self, conn: wsproto.WSConnection, *, name: str, role: str,
                  report_self: bool, message_format: str) -> None:
         self.conn = conn
         self.name = name
-        self.role = "Event" if role.lower() == "event" else "Universal"
+        self.role = role
         self.report_self = report_self
         self.message_format = message_format
         self._lock = threading.Lock()
@@ -81,52 +114,104 @@ class _WsSink:
     def deliver(self, event: dict[str, Any]) -> None:
         if self.closed:
             raise wsproto.WSError("closed")
+        if self.role not in ("Event", "Universal"):
+            return
         if event.get("post_type") == "message_sent" and not self.report_self:
             return
-        payload = dict(event)
-        if self.message_format == "string" and isinstance(payload.get("message"), list):
-            payload["message"] = seg_mod.render_cq(payload["message"])
-        with self._lock:
-            self.conn.send_text(json.dumps(payload, ensure_ascii=False))
+        payload = ev.shape(event, self.message_format)
+        self.send_raw(json.dumps(payload, ensure_ascii=False))
 
-    def close(self) -> None:
+    def send_raw(self, frame: str) -> None:
+        with self._lock:
+            if self.closed:
+                raise wsproto.WSError("closed")
+            self.conn.send_text(frame)
+
+    def close(self, code: int = 1000, reason: str = "") -> None:
+        if self.closed:
+            return
         self.closed = True
-        self.conn.close()
+        try:
+            self.conn.close(code, reason)
+        except (wsproto.WSError, OSError):
+            pass
+
+
+def _heartbeat_thread(sink: _WsSink, stop: threading.Event) -> None:
+    """30 秒一次 ping 保活；对端死掉由 socket 超时（90s）发现。"""
+    while not stop.wait(HEARTBEAT_INTERVAL):
+        if sink.closed:
+            return
+        try:
+            sink.conn.ping()
+        except (wsproto.WSError, OSError):
+            sink.close(1001, "ping failed")
+            return
+
+
+def serve_ws_loop(sink: _WsSink, dispatcher: ob.Dispatcher, hub: EventHub,
+                  log: Callable[[str], None], *, label: str,
+                  bootstrap: bool = True) -> None:
+    """一条 WS 连接的生命周期：握手之后的事件推送 + 动作处理。"""
+    stop = threading.Event()
+    hub.add(sink)
+    threading.Thread(target=_heartbeat_thread, args=(sink, stop), daemon=True).start()
+    log(f"[{label}] 框架已连接（role={sink.role}）")
+    try:
+        if bootstrap and sink.role in ("Event", "Universal"):
+            sink.deliver(dispatcher.lifecycle("connect"))
+            sink.deliver(dispatcher.lifecycle("enable"))
+            sink.deliver(dispatcher.heartbeat())
+        while not sink.closed:
+            text = sink.conn.recv_text()
+            if text is None:
+                break
+            try:
+                data = json.loads(text)
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            action = str(data.get("action") or "")
+            params = data.get("params")
+            if not isinstance(params, dict):
+                params = {k: v for k, v in data.items() if k not in ("action", "echo")}
+            echo = data.get("echo")
+            if sink.role not in ("Api", "Universal"):
+                # Event-only 连接不该发动作；与 SnowLuma 一致：忽略，不回包
+                log(f"[{label}] 忽略来自 Event-only 连接的动作 {action}")
+                continue
+            if not action:
+                continue
+            result = dispatcher.call(action, params)
+            if echo is not None:
+                result["echo"] = echo
+            sink.send_raw(json.dumps(result, ensure_ascii=False))
+    except (wsproto.WSError, OSError):
+        pass
+    finally:
+        stop.set()
+        hub.remove(sink)
+        if sink.role in ("Event", "Universal"):
+            try:
+                sink.deliver(dispatcher.lifecycle("disable"))
+            except Exception:
+                pass
+        sink.close()
+        log(f"[{label}] 框架断开")
 
 
 # ---------------------------------------------------------------- HTTP 动作
-def _extract_action(handler: BaseHTTPRequestHandler, body: bytes) -> tuple[str, dict[str, Any], Any]:
-    """兼容三种常见写法：JSON body / 表单 / GET 查询串。
-
-    第三个返回值是 `echo`：请求没带就返回 None，调用方此时**不要**往响应里塞 echo
-    （SnowLuma 只在请求带 echo 时才回）。
-    """
-    query = parse_qs(urlparse(handler.path).query)
-    echo: Any = (query.get("echo") or [None])[0]
-    if body:
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except ValueError:
-            data = None
-        if isinstance(data, dict):
-            if "echo" in data:
-                echo = data["echo"]
-            action = str(data.get("action") or "")
-            params = data.get("params")
-            if params is None:
-                params = {k: v for k, v in data.items() if k not in ("action", "echo")}
-            if not isinstance(params, dict):
-                params = {}
-            if action:
-                return action, params, echo
-    action = str((query.get("action") or [""])[0])
-    params = {k: (v[0] if isinstance(v, list) and v else v) for k, v in query.items()
-              if k not in ("action", "echo", "access_token")}
-    return action, params, echo
+def _auth_ok(headers: Any, query: dict[str, list[str]], token: str) -> bool:
+    if not token:
+        return True
+    auth = str(_header(headers, "Authorization"))
+    if auth == f"Bearer {token}":
+        return True
+    return (query.get("access_token") or [""])[0] == token
 
 
-def _get_header(headers: Any, name: str, default: str = "") -> str:
-    """兼容两种头部容器：`email.message`（大小写不敏感）和我们的 dict（键已小写）。"""
+def _header(headers: Any, name: str, default: str = "") -> str:
     try:
         value = headers.get(name)
     except Exception:
@@ -139,23 +224,22 @@ def _get_header(headers: Any, name: str, default: str = "") -> str:
     return str(value) if value is not None else default
 
 
-def _auth_ok(headers: Any, query: dict[str, list[str]], token: str) -> bool:
-    if not token:
-        return True
-    auth = _get_header(headers, "Authorization")
-    if auth.lower().startswith("bearer ") and auth[7:].strip() == token:
-        return True
-    if (query.get("access_token") or [""])[0] == token:
-        return True
-    # 有些框架把 token 放在 Sec-WebSocket-Protocol 里（OneBot v11 允许）
-    proto = _get_header(headers, "Sec-WebSocket-Protocol")
-    return bool(proto) and proto.strip() == token
+def _normalize_path(value: str) -> str:
+    path = (value or "/").strip() or "/"
+    if path == "/":
+        return "/"
+    return path[:-1] if path.endswith("/") else path
+
+
+def _json_value(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
 
 
 class _HttpMixin:
-    """HTTP 服务端与 WebUI 共用的 JSON 小工具。"""
-
-    server_version = "SnowLink/0.1"
+    server_version = "SnowLink"
 
     def _json(self, status: int, data: Any) -> None:
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -167,23 +251,40 @@ class _HttpMixin:
         self.end_headers()
         self.wfile.write(raw)
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # 静音：日志走我们自己的
+    def log_message(self, fmt: str, *args: Any) -> None:
         return
 
 
 def make_http_handler(dispatcher: ob.Dispatcher, hub: EventHub, cfg: HttpServer,
                       log: Callable[[str], None]) -> type[BaseHTTPRequestHandler]:
+    base = _normalize_path(cfg.path)
+
     class Handler(_HttpMixin, BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def _authorized(self) -> bool:
-            query = parse_qs(urlparse(self.path).query)
+        # ------------------------------------------------------------ 工具
+        def _failure(self, status: int, retcode: int, wording: str) -> None:
+            self._json(status, {"status": "failed", "retcode": retcode,
+                                "data": None, "wording": wording})
+
+        def _resolve(self) -> str | None:
+            """路径 -> 动作名；路径不在本服务上则回 404 并返回 None。"""
+            incoming = urlparse(self.path).path
+            if incoming in (base, base + "/"):
+                return ""
+            prefix = base if base.endswith("/") else base + "/"
+            if incoming.startswith(prefix):
+                return incoming[len(prefix):]
+            self._failure(HTTPStatus.NOT_FOUND, 1404, "not found")
+            return None
+
+        def _check_auth(self, query: dict[str, list[str]]) -> bool:
             if _auth_ok(self.headers, query, cfg.accessToken):
                 return True
-            self._json(HTTPStatus.UNAUTHORIZED, {"status": "failed", "retcode": 1401,
-                                                 "data": None, "wording": "accessToken 不对"})
+            self._failure(HTTPStatus.UNAUTHORIZED, 1401, "unauthorized")
             return False
 
+        # ------------------------------------------------------------ 方法
         def do_OPTIONS(self) -> None:  # noqa: N802
             self.send_response(HTTPStatus.NO_CONTENT)
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -193,86 +294,151 @@ def make_http_handler(dispatcher: ob.Dispatcher, hub: EventHub, cfg: HttpServer,
             self.end_headers()
 
         def do_GET(self) -> None:  # noqa: N802
-            if not self._authorized():
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            action = self._resolve()
+            if action is None:
                 return
-            if "websocket" in str(self.headers.get("Upgrade") or "").lower() and cfg.enableWebSocket:
-                self._upgrade()
+            if not self._check_auth(query):
                 return
-            action, params, echo = _extract_action(self, b"")
+            if "websocket" in _header(self.headers, "Upgrade").lower() and cfg.enableWebSocket:
+                self._upgrade(query)
+                return
             if not action:
                 self._json(HTTPStatus.OK, {"status": "ok", "retcode": 0,
-                                           "data": {"app": "SnowLink"}})
+                                           "data": {"online": True}})
                 return
+            params: dict[str, Any] = {}
+            for key, values in query.items():
+                if key in ("access_token",):
+                    continue
+                params[key] = _json_value(values[-1]) if values else ""
             result = dispatcher.call(action, params)
-            if echo is not None:
-                result["echo"] = echo
             self._json(HTTPStatus.OK, result)
 
         def do_POST(self) -> None:  # noqa: N802
-            if not self._authorized():
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            action = self._resolve()
+            if action is None:
                 return
+            if not self._check_auth(query):
+                return
+
             length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(length) if length else b""
-            action, params, echo = _extract_action(self, body)
+            if length > MAX_BODY:
+                self._failure(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, 1413,
+                              "request body too large")
+                return
+            body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+            params: dict[str, Any] = {}
+            echo: Any = None
+            content_type = str(self.headers.get("Content-Type") or "")
+
+            if body.strip():
+                if "application/x-www-form-urlencoded" in content_type:
+                    params, echo, action = self._parse_form(body, action)
+                elif "application/json" in content_type or not content_type:
+                    try:
+                        parsed_body = json.loads(body)
+                    except ValueError:
+                        if content_type:
+                            self._failure(HTTPStatus.BAD_REQUEST, 1400,
+                                          "bad request: invalid json")
+                            return
+                        params, echo, action = self._parse_form(body, action)
+                        parsed_body = None
+                    if parsed_body is not None:
+                        if not isinstance(parsed_body, dict) or isinstance(parsed_body, list):
+                            self._failure(HTTPStatus.BAD_REQUEST, 1400,
+                                          "bad request: invalid json")
+                            return
+                        if parsed_body.get("action") and not action:
+                            action = str(parsed_body["action"])
+                        nested = parsed_body.get("params")
+                        if isinstance(nested, dict):
+                            params = dict(nested)
+                        else:
+                            params = {k: v for k, v in parsed_body.items()
+                                      if k not in ("action", "echo")}
+                        echo = parsed_body.get("echo")
+                else:
+                    self._failure(HTTPStatus.BAD_REQUEST, 1400,
+                                  f"bad request: unsupported content-type: {content_type}")
+                    return
+
             if not action:
-                self._json(HTTPStatus.BAD_REQUEST, {"status": "failed", "retcode": 1400,
-                                                    "data": None, "wording": "缺少 action"})
+                self._failure(HTTPStatus.BAD_REQUEST, 1400, "bad request: missing action")
                 return
             result = dispatcher.call(action, params)
             if echo is not None:
                 result["echo"] = echo
             self._json(HTTPStatus.OK, result)
 
+        def do_PUT(self) -> None:  # noqa: N802
+            self._failure(HTTPStatus.METHOD_NOT_ALLOWED, 1400, "method not allowed")
+
+        do_DELETE = do_PUT  # type: ignore[assignment]
+        do_PATCH = do_PUT  # type: ignore[assignment]
+
+        def _parse_form(self, body: str, action: str) -> tuple[dict[str, Any], Any, str]:
+            params: dict[str, Any] = {}
+            for key, values in parse_qs(body, keep_blank_values=True).items():
+                params[key] = _json_value(values[-1]) if values else ""
+            echo = params.pop("echo", None)
+            if not action and params.get("action"):
+                action = str(params.pop("action"))
+            else:
+                params.pop("action", None)
+            return params, echo, action
+
         # ------------------------------------------------------------ WS 升级
-        def _upgrade(self) -> None:
+        def _upgrade(self, query: dict[str, list[str]]) -> None:
+            path = urlparse(self.path).path
+            role = _resolve_role(path, cfg)
+            if role is None:
+                self._failure(HTTPStatus.NOT_FOUND, 1404, "not found")
+                return
             try:
                 response = wsproto.build_accept({k.lower(): v for k, v in self.headers.items()})
             except wsproto.WSError as exc:
-                self._json(HTTPStatus.BAD_REQUEST, {"status": "failed", "retcode": 1400,
-                                                    "data": None, "wording": str(exc)})
+                self._failure(HTTPStatus.BAD_REQUEST, 1400, str(exc))
                 return
             self.wfile.write(response)
             self.wfile.flush()
             self.close_connection = True
             sink = _WsSink(wsproto.WSConnection(self.connection, mask=False),
-                           name=cfg.name, role="Universal",
-                           report_self=cfg.reportSelfMessage, message_format=cfg.messageFormat)
+                           name=cfg.name, role=role,
+                           report_self=cfg.reportSelfMessage,
+                           message_format=cfg.messageFormat)
             serve_ws_loop(sink, dispatcher, hub, log, label=f"http:{cfg.name}")
 
     return Handler
 
 
-# ---------------------------------------------------------------- WS 循环
-def serve_ws_loop(sink: _WsSink, dispatcher: ob.Dispatcher, hub: EventHub,
-                  log: Callable[[str], None], *, label: str) -> None:
-    hub.add(sink)
-    log(f"[{label}] 框架已连接")
-    try:
-        sink.deliver(dispatcher.lifecycle("connect"))
-        while True:
-            text = sink.conn.recv_text()
-            try:
-                data = json.loads(text)
-            except ValueError:
-                continue
-            if not isinstance(data, dict):
-                continue
-            action = str(data.get("action") or "")
-            params = data.get("params") or {}
-            echo = data.get("echo")
-            result = dispatcher.call(action, params if isinstance(params, dict) else {})
-            if echo is not None:
-                result["echo"] = echo
-            sink.conn.send_text(json.dumps(result, ensure_ascii=False))
-    except (wsproto.WSError, OSError):
-        pass
-    finally:
-        hub.remove(sink)
-        sink.close()
-        log(f"[{label}] 框架断开")
+def _resolve_role(path: str, cfg: Any) -> str | None:
+    """WS 角色：与 SnowLuma 的 `resolveForwardRole` 同规则。"""
+    base = _normalize_path(getattr(cfg, "path", "/"))
+    incoming = _normalize_path(path)
+    role = getattr(cfg, "role", None)
+    if role is None:
+        if incoming.endswith("/api"):
+            return "Api"
+        if incoming.endswith("/event"):
+            return "Event"
+        return "Universal"
+    if incoming == base:
+        return role
+    if role != "Universal" or base != "/":
+        return None
+    if incoming == "/api":
+        return "Api"
+    if incoming == "/event":
+        return "Event"
+    return None
 
 
-# ---------------------------------------------------------------- 正向 WS 服务端
+# ---------------------------------------------------------------- 正向 WS
 class _WsServerThread(threading.Thread):
     def __init__(self, cfg: WsServer, dispatcher: ob.Dispatcher, hub: EventHub,
                  log: Callable[[str], None], stop: threading.Event) -> None:
@@ -285,7 +451,7 @@ class _WsServerThread(threading.Thread):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((cfg.host, cfg.port))
-        self.sock.listen(8)
+        self.sock.listen(16)
         self.sock.settimeout(1.0)
 
     def run(self) -> None:
@@ -309,19 +475,21 @@ class _WsServerThread(threading.Thread):
             line, headers = wsproto.read_http_head(conn)
             parts = line.split()
             path = parts[1] if len(parts) > 1 else "/"
-            query = parse_qs(urlparse(path).query)
+            parsed = urlparse(path)
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            role = _resolve_role(parsed.path, self.cfg)
+            if role is None:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                conn.close()
+                return
             if not _auth_ok(headers, query, self.cfg.accessToken):
                 conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
                 conn.close()
                 return
-            if self.cfg.path not in ("", "/") and not path.startswith(self.cfg.path):
-                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                conn.close()
-                return
             conn.sendall(wsproto.build_accept(headers))
-            conn.settimeout(None)
+            conn.settimeout(HEARTBEAT_DEAD_AFTER)
             sink = _WsSink(wsproto.WSConnection(conn, mask=False), name=self.cfg.name,
-                           role=self.cfg.role, report_self=self.cfg.reportSelfMessage,
+                           role=role, report_self=self.cfg.reportSelfMessage,
                            message_format=self.cfg.messageFormat)
             serve_ws_loop(sink, self.dispatcher, self.hub, self.log, label=f"ws:{self.cfg.name}")
         except (wsproto.WSError, OSError, KeyError):
@@ -331,7 +499,7 @@ class _WsServerThread(threading.Thread):
                 pass
 
 
-# ---------------------------------------------------------------- 反向 WS 客户端
+# ---------------------------------------------------------------- 反向 WS
 class _ReverseWsThread(threading.Thread):
     def __init__(self, cfg: WsClient, dispatcher: ob.Dispatcher, hub: EventHub,
                  log: Callable[[str], None], stop: threading.Event) -> None:
@@ -348,7 +516,7 @@ class _ReverseWsThread(threading.Thread):
                 self._once()
             except (wsproto.WSError, OSError) as exc:
                 self.log(f"[ws-reverse:{self.cfg.name}] 断开：{exc}")
-            self.stop_event.wait(max(1, self.cfg.reconnectInterval))
+            self.stop_event.wait(max(1.0, float(self.cfg.reconnectInterval or 5)))
 
     def _once(self) -> None:
         parts = urlparse(self.cfg.url)
@@ -361,26 +529,29 @@ class _ReverseWsThread(threading.Thread):
             path += "?" + parts.query
         conn = socket.create_connection((host, port), timeout=10)
         self.log(f"[ws-reverse:{self.cfg.name}] 连接 {self.cfg.url}")
-        extra: dict[str, str] = {}
+        extra: dict[str, str] = {"X-Self-ID": str(self.dispatcher.self_id),
+                                 "X-Client-Role": "Universal"}
         if self.cfg.accessToken:
             extra["Authorization"] = f"Bearer {self.cfg.accessToken}"
         wsproto.client_handshake(conn, host, port, path, extra)
-        conn.settimeout(None)
+        conn.settimeout(HEARTBEAT_DEAD_AFTER)
         sink = _WsSink(wsproto.WSConnection(conn, mask=True), name=self.cfg.name,
                        role="Universal", report_self=self.cfg.reportSelfMessage,
                        message_format=self.cfg.messageFormat)
-        serve_ws_loop(sink, self.dispatcher, self.hub, self.log, label=f"ws-reverse:{self.cfg.name}")
+        serve_ws_loop(sink, self.dispatcher, self.hub, self.log,
+                      label=f"ws-reverse:{self.cfg.name}")
 
 
 # ---------------------------------------------------------------- HTTP 上报
 class _HttpReportThread(threading.Thread):
     def __init__(self, cfg: HttpClient, hub: EventHub, log: Callable[[str], None],
-                 stop: threading.Event) -> None:
+                 stop: threading.Event, self_id: Callable[[], int]) -> None:
         super().__init__(daemon=True, name=f"http-report-{cfg.name}")
         self.cfg = cfg
         self.hub = hub
         self.log = log
         self.stop_event = stop
+        self.self_id = self_id
         self.queue: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=1000)
         self._last_error = 0.0
 
@@ -405,16 +576,27 @@ class _HttpReportThread(threading.Thread):
                 event = self.queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            body = json.dumps(event, ensure_ascii=False).encode("utf-8")
-            headers = {"Content-Type": "application/json; charset=utf-8"}
+            payload = ev.shape(event, self.cfg.messageFormat)
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": "OneBot",
+                "X-Self-ID": str(self.self_id()),
+            }
             if self.cfg.accessToken:
-                headers["Authorization"] = f"Bearer {self.cfg.accessToken}"
+                digest = hmac.new(self.cfg.accessToken.encode("utf-8"), body, hashlib.sha1)
+                headers["X-Signature"] = "sha1=" + digest.hexdigest()
             cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
             conn = cls(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80),
                        timeout=self.cfg.timeout)
             try:
                 conn.request("POST", parts.path or "/", body=body, headers=headers)
-                conn.getresponse().read()
+                response = conn.getresponse()
+                raw = response.read()
+                if response.status >= 400:
+                    raise OSError(f"HTTP {response.status}")
+                if "application/json" in str(response.getheader("Content-Type") or ""):
+                    self._quick_operation(event, raw)
             except (OSError, http.client.HTTPException) as exc:
                 now = time.time()
                 if now - self._last_error > 60:
@@ -423,6 +605,49 @@ class _HttpReportThread(threading.Thread):
             finally:
                 conn.close()
 
+    def _quick_operation(self, event: dict[str, Any], raw: bytes) -> None:
+        """响应体是 JSON 就当作快速操作执行（reply / delete / ban）。"""
+        try:
+            operation = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return
+        if not isinstance(operation, dict) or event.get("post_type") != "message":
+            return
+        try:
+            reply = operation.get("reply")
+            if reply:
+                auto_escape = bool(operation.get("auto_escape"))
+                params: dict[str, Any] = {"message": reply, "auto_escape": auto_escape}
+                if event.get("message_type") == "group":
+                    params["group_id"] = event.get("group_id")
+                    if operation.get("at_sender") is not False and event.get("user_id"):
+                        at = {"type": "at", "data": {"qq": str(event["user_id"])}}
+                        if isinstance(reply, str):
+                            params["message"] = [at, {"type": "text", "data": {"text": reply}}]
+                            params["auto_escape"] = False
+                        elif isinstance(reply, list):
+                            params["message"] = [at, *reply]
+                    self.dispatcher_action("send_group_msg", params)
+                else:
+                    params["user_id"] = event.get("user_id")
+                    self.dispatcher_action("send_private_msg", params)
+            if operation.get("delete"):
+                self.dispatcher_action("delete_msg", {"message_id": event.get("message_id")})
+            if operation.get("ban") and event.get("message_type") == "group":
+                duration = operation.get("ban_duration")
+                self.dispatcher_action("set_group_ban", {
+                    "group_id": event.get("group_id"),
+                    "user_id": event.get("user_id"),
+                    "duration": duration if isinstance(duration, int) else 1800,
+                })
+        except Exception as exc:  # 快速操作失败不影响上报主链路
+            self.log(f"[http-report:{self.cfg.name}] quick operation 失败：{exc}")
+
+    def dispatcher_action(self, action: str, params: dict[str, Any]) -> None:
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.call(action, params)
+
 
 # ---------------------------------------------------------------- 总装
 class Gateway:
@@ -430,7 +655,7 @@ class Gateway:
 
     def __init__(self, cfg: OneBotConfig, backend_cfg: BackendConfig, *,
                  uin: str = "", log: Callable[[str], None] | None = None,
-                 app_name: str = "SnowLink") -> None:
+                 app_name: str = "SnowLink", app_version: str = "") -> None:
         self.cfg = cfg
         self.backend_cfg = backend_cfg
         self.uin = uin or backend_cfg.uin
@@ -448,11 +673,15 @@ class Gateway:
         elif cfg.httpServers:
             fmt = cfg.httpServers[0].messageFormat
         self.dispatcher = ob.Dispatcher(self.backend, self_id=self.uin, message_format=fmt,
-                                        app_name=app_name)
+                                        app_name=app_name, app_version=app_version,
+                                        on_event=self._publish)
         self._threads: list[threading.Thread] = []
         self._http_servers: list[ThreadingHTTPServer] = []
         self._started_at = 0.0
         self.log_lines: list[str] = []
+
+    def _publish(self, event: dict[str, Any]) -> None:
+        self.hub.publish(event)
 
     # ---------------------------------------------------------------- 日志
     def log(self, message: str) -> None:
@@ -480,9 +709,11 @@ class Gateway:
             thread.start()
             self._threads.append(thread)
         for cfg in self.cfg.httpClients:
-            thread = _HttpReportThread(cfg, self.hub, self.log, self.stop_event)
-            thread.start()
-            self._threads.append(thread)
+            reporter = _HttpReportThread(cfg, self.hub, self.log, self.stop_event,
+                                         lambda: self.dispatcher.self_id)
+            reporter.dispatcher = self.dispatcher  # type: ignore[attr-defined]
+            reporter.start()
+            self._threads.append(reporter)
         threading.Thread(target=self._consume_backend, daemon=True, name="backend-consumer").start()
         threading.Thread(target=self._heartbeat, daemon=True, name="heartbeat").start()
 
@@ -494,7 +725,8 @@ class Gateway:
             self._http_servers.append(server)
             threading.Thread(target=server.serve_forever, daemon=True,
                              name=f"http-{cfg.port}").start()
-            self.log(f"[http:{cfg.name}] 监听 http://{cfg.host}:{cfg.port}{cfg.path}")
+            extra = " 与 WebSocket" if cfg.enableWebSocket else ""
+            self.log(f"[http:{cfg.name}] 监听 http://{cfg.host}:{cfg.port}{cfg.path}{extra}")
         except OSError as exc:
             self.log(f"[http:{cfg.name}] 端口 {cfg.port} 起不来：{exc}")
 
@@ -526,25 +758,14 @@ class Gateway:
             self.hub.publish(event)
 
     def _heartbeat(self) -> None:
-        interval = 15
+        interval = ev.HEARTBEAT_INTERVAL_MS / 1000.0
         while not self.stop_event.wait(interval):
-            self.hub.publish(self.dispatcher.heartbeat(interval))
+            self.hub.publish(self.dispatcher.heartbeat())
 
     # ---------------------------------------------------------------- 发送（给 WebUI 用）
     def send_text(self, target: str, text: str, *, group: bool = False) -> dict[str, Any]:
         segments = [{"type": "text", "data": {"text": text}}]
         result = self.backend.send(target, segments, group=group)
-        if isinstance(self.backend, DemoBackend) and result.ok:
-            # 演示后端：把发出去的消息回显成一条收到的事件，链路可视
-            self.hub.publish(self.dispatcher.event_sent(target, group, result.message_id, segments))
-            self.hub.publish({
-                "time": int(time.time()), "self_id": int(self.uin or 0), "post_type": "message",
-                "message_type": "group" if group else "private",
-                "message_id": result.message_id,
-                "message": segments, "raw_message": text, "font": 0,
-                "sender": {"user_id": 10001, "nickname": "示例好友", "card": ""},
-                **({"group_id": int(target or 0)} if group else {"user_id": int(target or 0)}),
-            })
         return {"ok": result.ok, "code": result.code, "msg": result.msg, "id": result.message_id}
 
     def stats(self) -> dict[str, Any]:
@@ -554,7 +775,7 @@ class Gateway:
             "backend": getattr(self.backend, "name", "unknown"),
             "offline": bool(self.backend_cfg.offline),
             "self_id": self.dispatcher.self_id,
-            "nickname": self.dispatcher.nickname(),
+            "nickname": self.dispatcher.nickname,
             "events": self.hub.count,
             "actions": self.dispatcher.stats,
             "networks": {

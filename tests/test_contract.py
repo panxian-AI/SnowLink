@@ -21,7 +21,7 @@ def test_action_face_is_complete() -> None:
 
 def test_every_unimplemented_action_gives_a_reason() -> None:
     dispatcher = make()
-    implemented = set(dispatcher._handlers())
+    implemented = set(dispatcher._handlers) | set(dispatcher._specs)
     missing = []
     for name in C.ACTIONS:
         if name in implemented:
@@ -35,8 +35,13 @@ def test_every_unimplemented_action_gives_a_reason() -> None:
 def test_reason_text_is_actionable() -> None:
     """原因里必须提到这个动作名，否则上层看不出是哪一个失败。"""
     dispatcher = make()
-    for name in ("set_group_ban", "get_group_member_list", "upload_group_file"):
-        wording = dispatcher.call(name, {})["wording"]
+    cases = {
+        "get_group_member_list": {"group_id": 1},
+        "upload_group_file": {},
+        "get_cookies": {},
+    }
+    for name, params in cases.items():
+        wording = dispatcher.call(name, params)["wording"]
         assert name in wording
         assert len(wording) > len(name) + 4
 
@@ -91,8 +96,9 @@ def test_get_msg_shape_and_miss() -> None:
          "seq": 1, "ts": 1}
     )
     assert event is not None
-    got = dispatcher.call("get_msg", {"message_id": 456})["data"]
-    assert got["real_id"] == 456
+    message_id = event["message_id"]
+    got = dispatcher.call("get_msg", {"message_id": message_id})["data"]
+    assert got["real_id"] == message_id
     assert "post_type" not in got and "self_id" not in got
 
 

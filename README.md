@@ -29,10 +29,11 @@ SnowLink 的选择是：不碰 QQ 进程里的协议，借用 ArkLink 的官方�
 | 消息从哪来 | 注入 QQ 进程，解析私有协议 | ArkLink 操作已登录的官方客户端 |
 | QQ 更新协议 | 可能要重做注入层 | 不受影响（走界面） |
 | 对外接口 | OneBot v11（213 个动作） | OneBot v11（213 个动作**全部注册**，同端口、同配置字段、同 retcode） |
+| 协议细节 | 它定的 | **逐条对齐**：段解析、参数文案、message_id 哈希、WS 角色与心跳、上报签名与 quick operation |
 | 部署 | Windows / Docker | Windows / Linux / 小服务器（`arklink` 的部署方式） |
 | 富媒体 | 图片、语音、视频、卡片 | **目前只有文本**（其余明确返回 1404） |
 
-> 能力差异不藏着：213 个动作全部登记，会做的 12 个真做，其余 201 个返回
+> 能力差异不藏着：213 个动作全部登记，会做的 17 个真做，其余 196 个返回
 > `retcode: 1404` + 一句「为什么不行」+ 缺什么，**不会假装成功**，
 > 也不会把图片降级成 `[图片]` 发出去。
 > 具体见 [docs/兼容性.md](docs/兼容性.md)。
@@ -98,6 +99,16 @@ WebUI：http://127.0.0.1:5099       首次口令打印在控制台
 鉴权支持三种写法：`Authorization: Bearer <token>`、`?access_token=<token>`、
 `Sec-WebSocket-Protocol: <token>`（OneBot v11 的三种常见约定）。
 
+几个和上游一致的细节，接入时能少踩坑：
+
+- **WS 角色由路径决定**：`/api` → 只收动作，`/event` → 只推事件，其余 → 两样都行。
+  连 `/onebot/v11/ws` 拿到的是「两样都行」。
+- **连上先收三帧**：`lifecycle(connect)`、`lifecycle(enable)`、`heartbeat`；
+  之后每 30 秒一个 `heartbeat`，断开时补一个 `lifecycle(disable)`。
+- **`message_id` 是 int32 哈希，可以是负数**，别拿它当自增序号用。
+- **HTTP 上报带签名**：`X-Self-ID` + `X-Signature: sha1=<hmac>`（配了 token 时），
+  响应体回 JSON 会被当作 [quick operation](docs/兼容性.md#http-上报) 执行。
+
 ## WebUI
 
 `http://127.0.0.1:5099` —— 状态、网络、发一条、动作调试、最近事件、日志、配置编辑。
@@ -125,7 +136,10 @@ QQ 跑在服务器的无头虚拟屏里，SnowLink 只连 ArkLink 的 127.0.0.1:
 ## 开发
 
 ```bash
-python -m pytest -q        # 64 项：消息段 / 配置 / WS 帧 / 动作面 / 契约 / 四个出口
+python -m pytest -q        # 99 项：段编解码 / 参数文案 / 动作面 / 事件形状 / 四个出口 / 契约
 ```
+
+`tests/test_contract.py` 会拿真实的动作面做交叉校验（213 条是否齐全、每条是否都能给出可读原因、
+成功信封的键集合），所以改动作面时测试会先红。
 
 MIT License。

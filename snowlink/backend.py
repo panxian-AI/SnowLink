@@ -22,12 +22,22 @@ from urllib.parse import urlparse
 from . import segments as seg_mod
 
 
+def _as_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip()
+    return int(text) if text.isdigit() and len(text) <= 18 else 0
+
+
 @dataclass
 class SendResult:
     ok: bool
     code: int = 0
     msg: str = ""
     message_id: str = ""
+    sequence: int = 0
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -129,7 +139,12 @@ class ArkLinkBackend:
     def send(self, target: str, segments: list[dict[str, Any]], *,
              group: bool = False, dry_run: bool = False) -> SendResult:
         """发一条消息。结构化段优先；通道不支持时如实返回失败，不降级。"""
-        missing = seg_mod.unsupported(segments)
+        missing = [
+            str(seg.get("type") or "")
+            for seg in segments
+            if str(seg.get("type") or "") not in seg_mod.SENDABLE
+        ]
+        missing = list(dict.fromkeys(missing))
         if missing:
             names = "、".join(seg_mod.TYPE_NAMES.get(k, k) for k in missing)
             return SendResult(
@@ -140,11 +155,9 @@ class ArkLinkBackend:
             )
 
         text = seg_mod.text_of(segments)
-        payload: dict[str, Any] = {"to": target, "text": text}
+        payload: dict[str, Any] = {"to": target, "text": text, "dry_run": bool(dry_run)}
         if group:
             payload["group_id"] = target
-        if dry_run:
-            payload["dry_run"] = True
         data = self.request("POST", "/api/v1/send", payload)
         ok = bool(data.get("ok"))
         items = data.get("items") or []
@@ -161,8 +174,37 @@ class ArkLinkBackend:
             0,
             "",
             message_id=str(first.get("message_id") or first.get("id") or ""),
+            sequence=_as_int(first.get("seq") or first.get("sequence")),
             raw=data,
         )
+
+    # ---------------------------------------------------------------- 通道能力
+    def recall(self, message_id: int, *, target: Any = None, group: bool = False) -> None:
+        data = self.request("POST", "/api/v1/recall",
+                            {"message_id": message_id, "to": str(target or ""), "group": bool(group)})
+        self._raise_for(data)
+
+    def mute(self, group_id: int, user_id: int, duration: int) -> None:
+        self._raise_for(self.request("POST", "/api/v1/group/mute", {
+            "group_id": group_id, "user_id": user_id, "duration": duration,
+        }))
+
+    def kick(self, group_id: int, user_id: int, reject: bool = False) -> None:
+        self._raise_for(self.request("POST", "/api/v1/group/kick", {
+            "group_id": group_id, "user_id": user_id, "reject_add_request": reject,
+        }))
+
+    def history(self, session_id: int, *, group: bool, count: int = 20) -> dict[str, Any]:
+        query = f"?session_id={session_id}&group={int(group)}&count={count}"
+        data = self.request("GET", f"/api/v1/history{query}")
+        self._raise_for(data)
+        return data
+
+    @staticmethod
+    def _raise_for(data: dict[str, Any]) -> None:
+        """ArkLink 用 `ok:false + code + msg` 表达「做不到」，这里转成异常让上层如实返回。"""
+        if data.get("ok") is False:
+            raise BackendError(str(data.get("msg") or "通道做不到"), int(data.get("code") or 1404))
 
     # ---------------------------------------------------------------- 收消息
     def stream(self, on_event: Callable[[dict[str, Any]], None],
@@ -236,7 +278,12 @@ class DemoBackend:
 
     def send(self, target: str, segments: list[dict[str, Any]], *,
              group: bool = False, dry_run: bool = False) -> SendResult:
-        missing = seg_mod.unsupported(segments)
+        missing = [
+            str(seg.get("type") or "")
+            for seg in segments
+            if str(seg.get("type") or "") not in seg_mod.SENDABLE
+        ]
+        missing = list(dict.fromkeys(missing))
         if missing:
             names = "、".join(seg_mod.TYPE_NAMES.get(k, k) for k in missing)
             return SendResult(False, 1404, f"演示通道只能发文本，这条消息里有：{names}")
@@ -249,4 +296,18 @@ class DemoBackend:
             "ts": time.time(),
         }
         self.sent.append(item)
-        return SendResult(True, 0, "", message_id=item["message_id"], raw={"ok": True})
+        return SendResult(True, 0, "", message_id=item["message_id"], sequence=self._n,
+                          raw={"ok": True})
+
+    # ---------------------------------------------------------------- 通道能力
+    def recall(self, message_id: int, *, target: Any = None, group: bool = False) -> None:
+        raise BackendError("演示通道不能撤回消息", 1404)
+
+    def mute(self, group_id: int, user_id: int, duration: int) -> None:
+        raise BackendError("演示通道不能禁言", 1404)
+
+    def kick(self, group_id: int, user_id: int, reject: bool = False) -> None:
+        raise BackendError("演示通道不能踢人", 1404)
+
+    def history(self, session_id: int, *, group: bool, count: int = 20) -> dict[str, Any]:
+        raise BackendError("演示通道没有历史消息", 1404)

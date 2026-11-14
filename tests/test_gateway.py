@@ -111,9 +111,12 @@ def test_ws_server_roundtrip(gateway) -> None:
     wsproto.client_handshake(sock, "127.0.0.1", port, "/", {"Authorization": "Bearer ws-token"})
     conn = wsproto.WSConnection(sock, mask=True)
 
-    lifecycle = json.loads(conn.recv_text())
-    assert lifecycle["post_type"] == "meta_event"
-    assert lifecycle["meta_event_type"] == "lifecycle"
+    # 连上就先给三帧：lifecycle(connect) / lifecycle(enable) / heartbeat
+    frames = [json.loads(conn.recv_text()) for _ in range(3)]
+    assert [f.get("meta_event_type") for f in frames] == ["lifecycle", "lifecycle", "heartbeat"]
+    assert frames[0]["sub_type"] == "connect"
+    assert frames[1]["sub_type"] == "enable"
+    assert frames[2]["interval"] == 30000
 
     conn.send_text(json.dumps({"action": "get_version_info", "echo": 7}))
     result = json.loads(conn.recv_text())
@@ -184,7 +187,7 @@ def test_reverse_ws_connects_and_receives_lifecycle() -> None:
     gw.start()
     try:
         assert server.ready.wait(5)
-        assert wait_until(lambda: any(x.get("post_type") == "meta_event" for x in server.received))
+        assert wait_until(lambda: any(x.get("meta_event_type") == "lifecycle" for x in server.received))
     finally:
         gw.stop()
 
@@ -248,3 +251,161 @@ def test_echo_only_when_requested(gateway) -> None:
     assert "echo" not in data
     _status, data = call_http(port, {"action": "get_login_info", "echo": "abc"})
     assert data["echo"] == "abc"
+
+# ---------------------------------------------------------------- 路径与错误
+def test_path_is_action(gateway) -> None:
+    port = http_port(gateway)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/get_login_info", headers={"Authorization": "Bearer http-token"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert resp.status == 200 and data["data"]["user_id"] == 10000
+
+
+def test_base_path_routes_and_404() -> None:
+    """base 路径之外一律 404；base 之内路径即动作（base 为 / 时任何路径都是动作）。"""
+    cfg = OneBotConfig(httpServers=[HttpServer(accessToken="t", port=0, path="/onebot")],
+                       wsServers=[])
+    gw = Gateway(cfg, BackendConfig(offline=True), uin="10000", log=lambda _m: None)
+    gw.start()
+    try:
+        port = http_port(gw)
+        headers = {"Authorization": "Bearer t"}
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/onebot", headers=headers)
+        assert json.loads(conn.getresponse().read())["data"] == {"online": True}
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/onebot/get_login_info", headers=headers)
+        assert json.loads(conn.getresponse().read())["data"]["user_id"] == 10000
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/nope", headers=headers)
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        assert resp.status == 404 and data["retcode"] == 1404 and data["wording"] == "not found"
+        conn.close()
+    finally:
+        gw.stop()
+
+
+def test_action_from_path_wins_over_body(gateway) -> None:
+    port = http_port(gateway)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/get_login_info",
+                 json.dumps({"action": "get_status"}).encode(),
+                 {"Authorization": "Bearer http-token", "Content-Type": "application/json"})
+    data = json.loads(conn.getresponse().read())
+    conn.close()
+    assert data["data"]["user_id"] == 10000
+
+
+def test_put_is_405(gateway) -> None:
+    port = http_port(gateway)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("PUT", "/", b"{}", {"Authorization": "Bearer http-token",
+                                     "Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert resp.status == 405 and data["wording"] == "method not allowed"
+
+
+def test_form_post(gateway) -> None:
+    port = http_port(gateway)
+    body = "action=get_login_info&echo=abc"
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/", body, {
+        "Authorization": "Bearer http-token",
+        "Content-Type": "application/x-www-form-urlencoded",
+    })
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert data["retcode"] == 0 and data["echo"] == "abc"
+
+
+def test_bad_json_is_400(gateway) -> None:
+    port = http_port(gateway)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/", b"{not json", {
+        "Authorization": "Bearer http-token",
+        "Content-Type": "application/json",
+    })
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert resp.status == 400
+    assert data["wording"] == "bad request: invalid json"
+
+
+def test_missing_action_is_400(gateway) -> None:
+    port = http_port(gateway)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/", b"{}", {"Authorization": "Bearer http-token",
+                                      "Content-Type": "application/json"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert resp.status == 400 and data["wording"] == "bad request: missing action"
+
+
+def test_get_without_action_reports_online(gateway) -> None:
+    port = http_port(gateway)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/", headers={"Authorization": "Bearer http-token"})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())
+    conn.close()
+    assert data == {"status": "ok", "retcode": 0, "data": {"online": True}}
+
+
+def test_ws_role_by_path(gateway) -> None:
+    """/api 只收动作不发事件；/event 只发事件。"""
+    port = ws_port(gateway)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    wsproto.client_handshake(sock, "127.0.0.1", port, "/api",
+                             {"Authorization": "Bearer ws-token"})
+    conn = wsproto.WSConnection(sock, mask=True)
+    conn.send_text(json.dumps({"action": "get_login_info", "echo": "a"}))
+    result = json.loads(conn.recv_text())
+    assert result["retcode"] == 0 and result["echo"] == "a"
+    conn.close()
+
+
+def test_event_only_connection_ignores_actions(gateway) -> None:
+    port = ws_port(gateway)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    wsproto.client_handshake(sock, "127.0.0.1", port, "/event",
+                             {"Authorization": "Bearer ws-token"})
+    conn = wsproto.WSConnection(sock, mask=True)
+    for _ in range(3):
+        conn.recv_text()  # 三帧握手元事件
+    conn.send_text(json.dumps({"action": "get_login_info", "echo": "x"}))
+    sock.settimeout(0.5)
+    with pytest.raises((socket.timeout, OSError)):
+        conn.recv_text()
+    conn.close()
+
+
+def test_report_filters_self_messages() -> None:
+    """reportSelfMessage=false 时，message_sent 不上报。"""
+    capture = _Capture()
+    cfg = OneBotConfig(
+        httpServers=[], wsServers=[],
+        httpClients=[HttpClient(name="report", url=f"http://127.0.0.1:{capture.port}/push",
+                                reportSelfMessage=False)],
+    )
+    gw = Gateway(cfg, BackendConfig(offline=True), uin="10000", log=lambda _m: None)
+    gw.start()
+    try:
+        assert wait_until(lambda: len(gw.hub._sinks) >= 1)
+        gw.hub.publish({"post_type": "message_sent", "message_type": "private", "raw_message": "self"})
+        gw.hub.publish({"post_type": "message", "message_type": "private", "raw_message": "other"})
+        assert wait_until(lambda: capture.items)
+        assert [x["raw_message"] for x in capture.items] == ["other"]
+    finally:
+        gw.stop()
+        capture.close()
